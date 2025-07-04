@@ -1,0 +1,1965 @@
+diff --git a/examples/flux/README.md b/examples/flux/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c51d767099916040a33b59b8103b2a14c6da4c3
+--- /dev/null
++++ b/examples/flux/README.md
+@@ -0,0 +1,87 @@
++# Flux
++This document shows how to build and run a [Flux](https://huggingface.co/black-forest-labs/FLUX.1-dev/tree/main) with TensorRT-LLM.
++
++## Overview
++
++The TensorRT-LLM Flux implementation can be found in [tensorrt_llm/models/flux/model.py](../../tensorrt_llm/models/flux/model.py). The TensorRT-LLM Flux example code is located in [`examples/flux`](./). There are main files to build and run Flux with TensorRT-LLM:
++
++* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Flux model into tensorrt-llm checkpoint format.
++* [`run.py`](./run.py) to run the [diffusers](https://huggingface.co/docs/diffusers/index) pipeline with TensorRT engine(s) to generate images.
++
++## Support Matrix
++
++- [x] TP
++- [x] CP
++- [ ] ControlNet
++- [ ] FP8
++
++## Usage
++
++The TensorRT-LLM Flux example code locates at [examples/flux](./). It takes HuggingFace checkpiont as input, and builds the corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
++
++### Build DiT TensorRT engine(s)
++
++First, download the pretrained Flux checkpoint from [HuggingFace](https://huggingface.co/black-forest-labs/FLUX.1-dev/tree/main)
++
++This checkpoint will be converted to the TensorRT-LLM checkpoint format by [`convert_checkpoint.py`](./convert_checkpoint.py). After that, we can build TensorRT engine(s) with the TensorRT-LLM checkpoint.
++
++```
++# Convert to TRT-LLM
++python convert_checkpoint.py
++trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
++                --max_batch_size 1 \
++                --remove_input_padding disable
++```
++
++Set `--max_batch_size` to tell how many images at most you would like to generate. We disable `--remove_input_padding` since we don't need to padding Flux's patches.
++
++After build, we can find a `./engine_output` directory, it is ready for running DiT model with TensorRT-LLM now.
++
++### Generate images
++
++A [`run.py`](./run.py) is provided to generated images with the optimized TensorRT engines.
++
++Just run `python run.py` and we can see an image named `flux-dev.png` will be generated:
++![flux-dev.png](./flux-dev.png).
++
++### Tensor Parallel
++
++We can levaerage tensor parallel to further reduce latency and memory consumption on each GPU. We take 4 GPUs parallelism as an example:
++
++```
++# build dit engine
++python convert_checkpoint.py --tp_size 4
++trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
++                --max_batch_size 1 \
++                --remove_input_padding disable
++# run
++mpirun -n 4 --allow-run-as-root python run.py
++```
++
++### Context Parallel
++
++Context parallel is well at reduce latency since it has lower communication cost.
++
++```
++# build dit engine
++python convert_checkpoint.py --cp_size 4
++trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
++                --max_batch_size 1 \
++                --remove_input_padding disable
++# run
++mpirun -n 4 --allow-run-as-root python run.py
++```
++
++### Combine Tensor Parallel and Context Parallel
++
++Tensor Parallel and Context Parallel can be used together to better balance latency and memory consumption.
++
++```
++# build dit engine
++python convert_checkpoint.py --cp_size 2 --tp_size 2
++trtllm-build --checkpoint_dir ./tllm_checkpoint/ \
++                --max_batch_size 1 \
++                --remove_input_padding disable
++# run
++mpirun -n 4 --allow-run-as-root python run.py
++```
+diff --git a/examples/flux/convert_checkpoint.py b/examples/flux/convert_checkpoint.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf82564c730039ba500a886b9d010d511cfe52a7
+--- /dev/null
++++ b/examples/flux/convert_checkpoint.py
+@@ -0,0 +1,121 @@
++import argparse
++import os
++import time
++import traceback
++from concurrent.futures import ThreadPoolExecutor, as_completed
++
++import tensorrt_llm
++from tensorrt_llm._utils import release_gc
++from tensorrt_llm.logger import logger
++from tensorrt_llm.mapping import Mapping
++from tensorrt_llm.models import FluxTransformer2DModel
++
++
++def parse_arguments():
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--model_dir', type=str, default=None)
++    parser.add_argument('--tp_size',
++                        type=int,
++                        default=1,
++                        help='N-way tensor parallelism size')
++    parser.add_argument('--cp_size',
++                        type=int,
++                        default=1,
++                        help='N-way context parallelism size')
++    parser.add_argument(
++        '--dtype',
++        type=str,
++        default='bfloat16',
++        choices=['auto', 'float16', 'bfloat16', 'float32'],
++        help=
++        "The data type for the model weights and activations if not quantized. "
++        "If 'auto', the data type is automatically inferred from the source model; "
++        "however, if the source dtype is float32, it is converted to float16.")
++    parser.add_argument('--output_dir',
++                        type=str,
++                        default='tllm_checkpoint',
++                        help='The path to save the TensorRT-LLM checkpoint')
++    parser.add_argument(
++        '--workers',
++        type=int,
++        default=1,
++        help='The number of workers for converting checkpoint in parallel')
++    parser.add_argument(
++        '--save_config_only',
++        action="store_true",
++        default=False,
++        help=
++        'Only save the model config w/o read and converting weights, be careful, this is for debug only'
++    )
++    parser.add_argument('--log_level', type=str, default='info')
++
++    args = parser.parse_args()
++
++    return args
++
++
++def convert_and_save_hf(args):
++    model_dir = os.path.join(args.model_dir, 'transformer')
++    world_size = args.tp_size * args.cp_size
++    def convert_and_save_rank(args, rank):
++        mapping = Mapping(world_size=world_size,
++                            rank=rank,
++                            tp_size=args.tp_size,
++                            cp_size=args.cp_size)
++        tik = time.time()
++        flux = FluxTransformer2DModel.from_hugging_face(
++            model_dir,
++            args.dtype,
++            mapping=mapping
++        )
++        print(
++            f'Total time of reading and converting: {time.time()-tik:.3f} s'
++        )
++        tik = time.time()
++        flux.save_checkpoint(args.output_dir, save_config=(rank == 0))
++        del flux
++        print(f'Total time of saving checkpoint: {time.time()-tik:.3f} s')
++
++    execute(args.workers, [convert_and_save_rank] * world_size, args)
++    release_gc()
++
++
++def execute(workers, func, args):
++    if workers == 1:
++        for rank, f in enumerate(func):
++            f(args, rank)
++    else:
++        with ThreadPoolExecutor(max_workers=workers) as p:
++            futures = [p.submit(f, args, rank) for rank, f in enumerate(func)]
++            exceptions = []
++            for future in as_completed(futures):
++                try:
++                    future.result()
++                except Exception as e:
++                    traceback.print_exc()
++                    exceptions.append(e)
++            assert len(
++                exceptions
++            ) == 0, "Checkpoint conversion failed, please check error log."
++
++
++def main():
++    print(tensorrt_llm.__version__)
++    args = parse_arguments()
++    logger.set_level(args.log_level)
++
++    tik = time.time()
++
++    if not os.path.exists(args.output_dir):
++        os.makedirs(args.output_dir)
++
++    assert args.model_dir is not None
++    convert_and_save_hf(args)
++
++    tok = time.time()
++    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
++    print(f'Total time of converting checkpoints: {t}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/examples/flux/run.py b/examples/flux/run.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3bbdef3a2b959087986ae071c6fd846a45d70b3
+--- /dev/null
++++ b/examples/flux/run.py
+@@ -0,0 +1,246 @@
++import argparse
++import json
++import os
++from functools import wraps
++
++import tensorrt as trt
++import torch
++from cuda import cudart
++from diffusers import FluxPipeline
++from diffusers.models.modeling_outputs import Transformer2DModelOutput
++
++import tensorrt_llm
++from tensorrt_llm._utils import str_dtype_to_torch, trt_dtype_to_torch
++from tensorrt_llm.logger import logger
++from tensorrt_llm.models.flux.config import FluxConfig
++from tensorrt_llm.runtime.session import Session
++
++
++def CUASSERT(cuda_ret):
++    err = cuda_ret[0]
++    if err != cudart.cudaError_t.cudaSuccess:
++        raise RuntimeError(
++            f"CUDA ERROR: {err}, error code reference: https://nvidia.github.io/cuda-python/module/cudart.html#cuda.cudart.cudaError_t"
++        )
++    if len(cuda_ret) > 1:
++        return cuda_ret[1:]
++    return None
++
++
++class TllmFlux(object):
++
++    def __init__(self,
++                 config,
++                 debug_mode=True,
++                 stream: torch.cuda.Stream = None):
++        self.dtype = config['pretrained_config']['dtype']
++        self.config = FluxConfig.from_dict(config['pretrained_config'])
++
++        rank = tensorrt_llm.mpi_rank()
++        world_size = config['pretrained_config']['mapping']['world_size']
++        cp_size = config['pretrained_config']['mapping']['cp_size']
++        tp_size = config['pretrained_config']['mapping']['tp_size']
++        pp_size = config['pretrained_config']['mapping']['pp_size']
++        assert pp_size == 1
++        self.mapping = tensorrt_llm.Mapping(world_size=world_size,
++                                            rank=rank,
++                                            cp_size=cp_size,
++                                            tp_size=tp_size,
++                                            pp_size=1,
++                                            gpus_per_node=args.gpus_per_node)
++
++        local_rank = rank % self.mapping.gpus_per_node
++        self.device = torch.device(f'cuda:{local_rank}')
++        torch.cuda.set_device(self.device)
++        CUASSERT(cudart.cudaSetDevice(local_rank))
++
++        self.stream = stream
++        if self.stream is None:
++            self.stream = torch.cuda.Stream(self.device)
++        torch.cuda.set_stream(self.stream)
++
++        engine_file = os.path.join(args.tllm_model_dir, f"rank{rank}.engine")
++        logger.info(f'Loading engine from {engine_file}')
++        with open(engine_file, "rb") as f:
++            engine_buffer = f.read()
++
++        assert engine_buffer is not None
++
++        self.session = Session.from_serialized_engine(engine_buffer)
++
++        self.debug_mode = debug_mode
++
++        self.inputs = {}
++        self.outputs = {}
++        self.buffer_allocated = False
++
++        expected_tensor_names = [
++            'hidden_states',
++            'encoder_hidden_states',
++            'pooled_projections',
++            'timestep',
++            'img_ids',
++            'txt_ids',
++            'guidance',
++            'output']
++
++        found_tensor_names = [
++            self.session.engine.get_tensor_name(i)
++            for i in range(self.session.engine.num_io_tensors)
++        ]
++        if not self.debug_mode and set(expected_tensor_names) != set(
++                found_tensor_names):
++            logger.error(
++                f"The following expected tensors are not found: {set(expected_tensor_names).difference(set(found_tensor_names))}"
++            )
++            logger.error(
++                f"Those tensors in engine are not expected: {set(found_tensor_names).difference(set(expected_tensor_names))}"
++            )
++            logger.error(f"Expected tensor names: {expected_tensor_names}")
++            logger.error(f"Found tensor names: {found_tensor_names}")
++            raise RuntimeError(
++                "Tensor names in engine are not the same as expected.")
++        if self.debug_mode:
++            self.debug_tensors = list(
++                set(found_tensor_names) - set(expected_tensor_names))
++
++    def _tensor_dtype(self, name):
++        # return torch dtype given tensor name for convenience
++        dtype = trt_dtype_to_torch(self.session.engine.get_tensor_dtype(name))
++        return dtype
++
++    def _setup(self, outputs_shape):
++        for i in range(self.session.engine.num_io_tensors):
++            name = self.session.engine.get_tensor_name(i)
++            if self.session.engine.get_tensor_mode(
++                    name) == trt.TensorIOMode.OUTPUT:
++                shape = list(self.session.engine.get_tensor_shape(name))
++                if self.debug_mode:
++                    shape = list(self.session.engine.get_tensor_shape(name))
++                    if shape[0] == -1:
++                        shape[0] = outputs_shape['output'][0]
++                else:
++                    shape = outputs_shape[name]
++                self.outputs[name] = torch.empty(shape,
++                                                 dtype=self._tensor_dtype(name),
++                                                 device=self.device)
++
++        self.buffer_allocated = True
++
++    def cuda_stream_guard(func):
++        """Sync external stream and set current stream to the one bound to the session. Reset on exit.
++        """
++
++        @wraps(func)
++        def wrapper(self, *args, **kwargs):
++            external_stream = torch.cuda.current_stream()
++            if external_stream != self.stream:
++                external_stream.synchronize()
++                torch.cuda.set_stream(self.stream)
++            ret = func(self, *args, **kwargs)
++            if external_stream != self.stream:
++                self.stream.synchronize()
++                torch.cuda.set_stream(external_stream)
++            return ret
++
++        return wrapper
++
++    def __call__(self, *args, **kwargs):
++        return self.forward(*args, **kwargs)
++
++    @cuda_stream_guard
++    def forward(self,
++        hidden_states: torch.Tensor,
++        encoder_hidden_states: torch.Tensor = None,
++        pooled_projections: torch.Tensor = None,
++        timestep: torch.LongTensor = None,
++        img_ids: torch.Tensor = None,
++        txt_ids: torch.Tensor = None,
++        guidance: torch.Tensor = None,
++        joint_attention_kwargs = None,
++        controlnet_block_samples=None,
++        controlnet_single_block_samples=None,
++        return_dict: bool = True,):
++        self._setup(outputs_shape={'output': hidden_states.shape})
++        if not self.buffer_allocated:
++            raise RuntimeError('Buffer not allocated, please call setup first!')
++        if controlnet_block_samples is not None or controlnet_single_block_samples is not None:
++            raise NotImplementedError()
++        inputs = {
++            'hidden_states': hidden_states.to(str_dtype_to_torch(self.dtype)),
++            'encoder_hidden_states': encoder_hidden_states.to(str_dtype_to_torch(self.dtype)),
++            'pooled_projections': pooled_projections.to(str_dtype_to_torch(self.dtype)),
++            'timestep': timestep.to(str_dtype_to_torch(self.dtype)),
++            'img_ids': img_ids.to(str_dtype_to_torch(self.dtype)),
++            'txt_ids': txt_ids.to(str_dtype_to_torch(self.dtype)),
++            'guidance': guidance.float()
++        }
++        for k, v in inputs.items():
++            inputs[k] = v.cuda().contiguous()
++        self.inputs.update(**inputs)
++        self.session.set_shapes(self.inputs)
++        ok = self.session.run(self.inputs, self.outputs,
++                              self.stream.cuda_stream)
++
++        if not ok:
++            raise RuntimeError('Executing TRT engine failed!')
++        output = self.outputs['output']
++
++        if self.debug_mode:
++            torch.cuda.synchronize()
++            for k, v in self.inputs.items():
++                print(k, v.sum())
++            for k, v in self.outputs.items():
++                print(k, v.sum())
++            output_np = {k: v.cpu().float().numpy() for k, v in self.outputs.items()}
++            import numpy as np
++            np.savez("tllm_output.npz", **output_np)
++
++        if not return_dict:
++            return (output,)
++        else:
++            return Transformer2DModelOutput(sample=output)
++
++
++def main(args):
++    tensorrt_llm.logger.set_level(args.log_level)
++
++    assert torch.cuda.is_available()
++
++    # Load model:
++    config_file = os.path.join(args.tllm_model_dir, 'config.json')
++    with open(config_file) as f:
++        config = json.load(f)
++    model = TllmFlux(config, debug_mode=args.debug_mode)
++
++    pipe = FluxPipeline.from_pretrained("./FLUX.1-dev", torch_dtype=torch.bfloat16)
++
++    # replace flux transformer with TRTLLM model
++    del pipe.transformer
++    torch.cuda.empty_cache()
++    pipe.to("cuda")
++    pipe.transformer = model
++
++    prompt = "A cat holding a sign that says hello world"
++    image = pipe(
++        prompt,
++        height=1024,
++        width=1024,
++        guidance_scale=3.5,
++        num_inference_steps=50,
++        max_sequence_length=512,
++        generator=torch.Generator("cpu").manual_seed(0)
++    ).images[0]
++    image.save("flux-dev.png")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--tllm_model_dir",
++                        type=str,
++                        default='./engine_outputs/')
++    parser.add_argument("--gpus_per_node", type=int, default=8)
++    parser.add_argument('--log_level', type=str, default='info')
++    parser.add_argument("--debug_mode", type=bool, default=False)
++    args = parser.parse_args()
++    main(args)
+diff --git a/tensorrt_llm/functional.py b/tensorrt_llm/functional.py
+index b458e294521d150b6226b5cab909a2d13e82136c..d93760f94fef585c719969036344db787b956c21 100755
+--- a/tensorrt_llm/functional.py
++++ b/tensorrt_llm/functional.py
+@@ -452,6 +452,18 @@ class Tensor(object):
+         '''
+         return sqrt(self)
+ 
++    def squeeze(self, dim, zero_is_placeholder):
++        '''
++        See functional.squeeze.
++        '''
++        return squeeze(self, dim, zero_is_placeholder)
++
++    def unsqueeze(self, dim):
++        '''
++        See functional.squeeze.
++        '''
++        return unsqueeze(self, dim)
++
+     def log(self):
+         '''
+         See functional.log.
+@@ -2082,6 +2094,8 @@ def select(input: Tensor, dim: int, index: Union[Tensor, int]) -> Tensor:
+     assert index.rank() == 1 and index.size(
+         0) == 1, f"index should have rank 1, got {index.rank()}"
+ 
++    dim = dim_resolve_negative(dim, input.ndim())[0]
++
+     new_shape = []
+     for i in range(input.rank()):
+         if i != dim:
+@@ -3693,6 +3707,7 @@ def unbind(input: Tensor, dim: int = 0):
+     '''
+     ndim = input.ndim()
+     outputs = split(input, 1, dim)
++    dim = dim_resolve_negative(dim, input.ndim())[0]
+     output_shape = [input.shape[i] for i in range(ndim) if i != dim]
+     return [output.view(output_shape) for output in outputs]
+ 
+@@ -4578,7 +4593,6 @@ class RopeEmbeddingUtils:
+ 
+             result = concat([y_part0, y_part1], dim=3)
+             return result.view(shape(tensor))
+-
+         else:
+             raise ValueError('The PositionEmbeddingType is not RoPE')
+         return (tensor * cos) + (rotate_func(tensor) * sin)
+diff --git a/tensorrt_llm/layers/activation.py b/tensorrt_llm/layers/activation.py
+index 94ea283a1cf327ce12af2054696023d5ed3312c4..d55804dbab326b028b6b7226c5ad48b11a7ce750 100644
+--- a/tensorrt_llm/layers/activation.py
++++ b/tensorrt_llm/layers/activation.py
+@@ -12,11 +12,58 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-from ..functional import softplus, tanh
++from ..functional import Tensor, gelu, relu, silu, softplus, tanh
+ from ..module import Module
+ 
+ 
++class SiLU(Module):
++
++    def forward(self, input: Tensor) -> Tensor:
++        return silu(input)
++
++class FP32SiLU(Module):
++    r"""
++    SiLU activation function with input upcasted to float32.
++    """
++
++    def __init__(self):
++        super().__init__()
++
++    def forward(self, inputs: Tensor) -> Tensor:
++        return silu(inputs.cast('float32')).cast(inputs.dtype)
++
+ class Mish(Module):
+ 
+-    def forward(self, input):
++    def forward(self, input: Tensor) -> Tensor:
+         return input * tanh(softplus(input, beta=1.0, threshold=20.0))
++
++class GELU(Module):
++    def __init__(self, approximate: str = 'tanh') -> None:
++        super().__init__()
++        self.approximate = approximate
++        if approximate != 'tanh':
++            raise NotImplementedError('GELU only support tanh now.')
++
++    def forward(self, input: Tensor) -> Tensor:
++        return gelu(input)
++
++class ReLU(Module):
++
++    def forward(self, input):
++        return relu(input)
++
++ACTIVATION_FUNCTIONS = {
++    "swish": SiLU(),
++    "silu": SiLU(),
++    "mish": Mish(),
++    "gelu": GELU(),
++    "relu": ReLU(),
++    "silu_fp32": FP32SiLU(),
++}
++
++def get_activation(act_fn: str) -> Module:
++    act_fn = act_fn.lower()
++    if act_fn in ACTIVATION_FUNCTIONS:
++        return ACTIVATION_FUNCTIONS[act_fn]
++    else:
++        raise ValueError(f"Unsupported activation function: {act_fn}")
+diff --git a/tensorrt_llm/layers/embedding.py b/tensorrt_llm/layers/embedding.py
+index 8472c040eb6829afbcf2688eb0be467ae9c42c7c..90443e922f0df3f0a6d0a8309569f098167ebf99 100644
+--- a/tensorrt_llm/layers/embedding.py
++++ b/tensorrt_llm/layers/embedding.py
+@@ -13,16 +13,19 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ import math
+-from typing import Optional
++from typing import List, Optional, Union
+ 
+ import numpy as np
+ import torch
+ 
+ from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
+-from ..functional import constant, embedding, unsqueeze, where
++from ..functional import (Tensor, arange, concat, constant, cos, embedding, exp,
++                          repeat_interleave, select, sin, unsqueeze, where)
+ from ..mapping import Mapping
+ from ..module import Module
+ from ..parameter import Parameter
++from .activation import get_activation
++from .linear import ColumnLinear, Linear, RowLinear
+ 
+ 
+ class Embedding(Module):
+@@ -181,3 +184,277 @@ class PromptTuningEmbedding(Embedding):
+         # combine the correct sources of embedding: normal/prompt
+         return where(unsqueeze(prompt_tokens_mask, -1), prompt_embeddings,
+                      normal_embeddings)
++
++def get_1d_rotary_pos_embed(
++    dim: int,
++    pos: Union[np.ndarray, int],
++    theta: float = 10000.0,
++    use_real=False,
++    linear_factor=1.0,
++    ntk_factor=1.0,
++    repeat_interleave_real=True,
++    freqs_dtype="float32",
++):
++    """
++    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
++
++    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim' and the end
++    index 'end'. The 'theta' parameter scales the frequencies. The returned tensor contains complex values in complex64
++    data type.
++
++    Args:
++        dim (`int`): Dimension of the frequency tensor.
++        pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
++        theta (`float`, *optional*, defaults to 10000.0):
++            Scaling factor for frequency computation. Defaults to 10000.0.
++        use_real (`bool`, *optional*):
++            If True, return real part and imaginary part separately. Otherwise, return complex numbers.
++        linear_factor (`float`, *optional*, defaults to 1.0):
++            Scaling factor for the context extrapolation. Defaults to 1.0.
++        ntk_factor (`float`, *optional*, defaults to 1.0):
++            Scaling factor for the NTK-Aware RoPE. Defaults to 1.0.
++        repeat_interleave_real (`bool`, *optional*, defaults to `True`):
++            If `True` and `use_real`, real part and imaginary part are each interleaved with themselves to reach `dim`.
++            Otherwise, they are concateanted with themselves.
++        freqs_dtype (`float32` or `float64`, *optional*, defaults to `float32`):
++            the dtype of the frequency tensor.
++    Returns:
++        `Tensor`: Precomputed frequency tensor with complex exponentials. [S, D/2]
++    """
++    assert dim % 2 == 0
++
++    if isinstance(pos, int):
++        pos = arange(0, pos, dtype='float32')
++    if isinstance(pos, np.ndarray):
++        pos = constant(pos)
++
++    theta = theta * ntk_factor
++    freqs = (
++        1.0
++        / (theta ** (np.arange(0, dim, 2, dtype=freqs_dtype)[: (dim // 2)] / dim))
++        / linear_factor
++    )  # [D/2]
++    freqs = constant(freqs)
++    freqs = unsqueeze(pos, 1) * unsqueeze(freqs, 0) # [S, D/2]
++    if use_real and repeat_interleave_real:
++        # flux, hunyuan-dit, cogvideox
++        freqs_cos = repeat_interleave(cos(freqs), repeats=2, dim=1).cast('float32')  # [S, D]
++        freqs_sin = repeat_interleave(sin(freqs), repeats=2, dim=1).cast('float32')  # [S, D]
++        return freqs_cos, freqs_sin
++    elif use_real:
++        # stable audio
++        freqs_cos = concat([cos(freqs), cos(freqs)], dim=-1).cast('float32')  # [S, D]
++        freqs_sin = concat([sin(freqs), sin(freqs)], dim=-1).cast('float32')  # [S, D]
++        return freqs_cos, freqs_sin
++    else:
++        raise NotImplementedError()
++
++class FluxPosEmbed(Module):
++    def __init__(self, theta: int, axes_dim: List[int]):
++        super().__init__()
++        self.theta = theta
++        self.axes_dim = axes_dim
++
++    def forward(self, ids: Tensor) -> Tensor:
++        n_axes = ids.shape[-1]
++        cos_out = []
++        sin_out = []
++        pos = ids.cast("float32")
++        # TODO: TRT don't support float64, so we use float32 here, this might lead to accuracy issue
++        freqs_dtype = "float32" # "float64"
++        for i in range(n_axes):
++            cos, sin = get_1d_rotary_pos_embed(
++                self.axes_dim[i], select(pos, dim=-1, index=i), repeat_interleave_real=True, use_real=True, freqs_dtype=freqs_dtype
++            )
++            cos_out.append(cos)
++            sin_out.append(sin)
++        freqs_cos = concat(cos_out, dim=-1)
++        freqs_sin = concat(sin_out, dim=-1)
++        return freqs_cos, freqs_sin
++
++
++def get_timestep_embedding(
++    timesteps: Tensor,
++    embedding_dim: int,
++    flip_sin_to_cos: bool = False,
++    downscale_freq_shift: float = 1,
++    scale: float = 1,
++    max_period: int = 10000,
++) -> Tensor:
++    """
++    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
++
++    Args
++        timesteps (Tensor):
++            a 1-D Tensor of N indices, one per batch element. These may be fractional.
++        embedding_dim (int):
++            the dimension of the output.
++        flip_sin_to_cos (bool):
++            Whether the embedding order should be `cos, sin` (if True) or `sin, cos` (if False)
++        downscale_freq_shift (float):
++            Controls the delta between frequencies between dimensions
++        scale (float):
++            Scaling factor applied to the embeddings.
++        max_period (int):
++            Controls the maximum frequency of the embeddings
++    Returns
++        Tensor: an [N x dim] Tensor of positional embeddings.
++    """
++    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
++
++    half_dim = embedding_dim // 2
++    exponent = -math.log(max_period) * np.arange(
++        start=0, stop=half_dim, dtype=np.float32
++    )
++    exponent = exponent / (half_dim - downscale_freq_shift)
++    exponent = constant(exponent)
++
++    emb = exp(exponent)
++    emb = unsqueeze(timesteps, -1).cast('float32') * unsqueeze(emb, 0)
++
++    # scale embeddings
++    emb = scale * emb
++
++    # flip sine and cosine embeddings
++    if flip_sin_to_cos:
++        emb = concat([cos(emb), sin(emb)], dim=-1)
++    else:
++        emb = concat([sin(emb), cos(emb)], dim=-1)
++
++    # zero pad
++    if embedding_dim % 2 == 1:
++        raise NotImplementedError()
++    return emb
++
++class TimestepEmbedding(Module):
++    def __init__(
++        self,
++        in_channels: int,
++        time_embed_dim: int,
++        act_fn: str = "silu",
++        out_dim: int = None,
++        post_act_fn: Optional[str] = None,
++        cond_proj_dim=None,
++        sample_proj_bias=True,
++        mapping=None,
++        dtype=None
++    ):
++        super().__init__()
++        tp_group = mapping.tp_group
++        tp_size = mapping.tp_size
++        self.linear_1 = ColumnLinear(in_channels, time_embed_dim, sample_proj_bias, tp_group=tp_group, tp_size=tp_size, dtype=dtype, gather_output=False)
++
++        if cond_proj_dim is not None:
++            self.cond_proj = Linear(cond_proj_dim, in_channels, bias=False, dtype=dtype)
++        else:
++            self.cond_proj = None
++
++        self.act = get_activation(act_fn)
++
++        if out_dim is not None:
++            time_embed_dim_out = out_dim
++        else:
++            time_embed_dim_out = time_embed_dim
++        self.linear_2 = RowLinear(time_embed_dim, time_embed_dim_out, sample_proj_bias, tp_group=tp_group, tp_size=tp_size, dtype=dtype)
++
++        if post_act_fn is None:
++            self.post_act = None
++        else:
++            self.post_act = get_activation(post_act_fn)
++
++    def forward(self, sample, condition=None):
++        if condition is not None:
++            sample = sample + self.cond_proj(condition)
++        sample = self.linear_1(sample)
++
++        if self.act is not None:
++            sample = self.act(sample)
++
++        sample = self.linear_2(sample)
++
++        if self.post_act is not None:
++            sample = self.post_act(sample)
++        return sample
++
++
++class Timesteps(Module):
++    def __init__(self, num_channels: int, flip_sin_to_cos: bool, downscale_freq_shift: float, scale: int = 1):
++        super().__init__()
++        self.num_channels = num_channels
++        self.flip_sin_to_cos = flip_sin_to_cos
++        self.downscale_freq_shift = downscale_freq_shift
++        self.scale = scale
++
++    def forward(self, timesteps) -> Tensor:
++        t_emb = get_timestep_embedding(
++            timesteps,
++            self.num_channels,
++            flip_sin_to_cos=self.flip_sin_to_cos,
++            downscale_freq_shift=self.downscale_freq_shift,
++            scale=self.scale,
++        )
++        return t_emb
++
++class PixArtAlphaTextProjection(Module):
++    """
++    Projects caption embeddings. Also handles dropout for classifier-free guidance.
++
++    Adapted from https://github.com/PixArt-alpha/PixArt-alpha/blob/master/diffusion/model/nets/PixArt_blocks.py
++    """
++
++    def __init__(self, in_features, hidden_size, out_features=None, act_fn="gelu_tanh", mapping=None, dtype=None):
++        super().__init__()
++        if out_features is None:
++            out_features = hidden_size
++        tp_group = mapping.tp_group
++        tp_size = mapping.tp_size
++        self.linear_1 = ColumnLinear(in_features=in_features, out_features=hidden_size, bias=True, tp_group=tp_group, tp_size=tp_size, dtype=dtype, gather_output=False)
++        self.act_1 = get_activation(act_fn)
++        self.linear_2 = RowLinear(in_features=hidden_size, out_features=out_features, bias=True, tp_group=tp_group, tp_size=tp_size, dtype=dtype)
++
++    def forward(self, caption):
++        hidden_states = self.linear_1(caption)
++        hidden_states = self.act_1(hidden_states)
++        hidden_states = self.linear_2(hidden_states)
++        return hidden_states
++
++class CombinedTimestepGuidanceTextProjEmbeddings(Module):
++    def __init__(self, embedding_dim, pooled_projection_dim, mapping=None, dtype=None):
++        super().__init__()
++
++        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
++        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim, mapping=mapping, dtype=dtype)
++        self.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim, mapping=mapping, dtype=dtype)
++        self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim, embedding_dim, act_fn="silu", mapping=mapping, dtype=dtype)
++
++    def forward(self, timestep, guidance, pooled_projection):
++        timesteps_proj = self.time_proj(timestep)
++        timesteps_emb = self.timestep_embedder(timesteps_proj.cast(pooled_projection.dtype))  # (N, D)
++
++        guidance_proj = self.time_proj(guidance)
++        guidance_emb = self.guidance_embedder(guidance_proj.cast(pooled_projection.dtype))  # (N, D)
++
++        time_guidance_emb = timesteps_emb + guidance_emb
++
++        pooled_projections = self.text_embedder(pooled_projection)
++        conditioning = time_guidance_emb + pooled_projections
++
++        return conditioning
++
++class CombinedTimestepTextProjEmbeddings(Module):
++    def __init__(self, embedding_dim, pooled_projection_dim, mapping=None, dtype=None):
++        super().__init__()
++
++        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0)
++        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim, mapping=mapping, dtype=dtype)
++        self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim, embedding_dim, act_fn="silu", mapping=mapping, dtype=dtype)
++
++    def forward(self, timestep: Tensor, pooled_projection: Tensor):
++        timesteps_proj = self.time_proj(timestep)
++        timesteps_emb = self.timestep_embedder(timesteps_proj.cast(dtype=pooled_projection.dtype))  # (N, D)
++
++        pooled_projections = self.text_embedder(pooled_projection)
++
++        conditioning = timesteps_emb + pooled_projections
++
++        return conditioning
+diff --git a/tensorrt_llm/layers/normalization.py b/tensorrt_llm/layers/normalization.py
+index 4c1c7f66ded38f406f4e73bfaf13bad6a220a816..e567c0919a8b08f8262f28408d1c278f4790d0dd 100644
+--- a/tensorrt_llm/layers/normalization.py
++++ b/tensorrt_llm/layers/normalization.py
+@@ -12,9 +12,14 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-from ..functional import group_norm, layer_norm, rms_norm
++from typing import Optional, Tuple
++
++from ..functional import (Tensor, chunk, group_norm, layer_norm, rms_norm,
++                          unsqueeze)
+ from ..module import Module
+ from ..parameter import Parameter
++from .activation import SiLU
++from .linear import Linear
+ 
+ 
+ class LayerNorm(Module):
+@@ -54,6 +59,15 @@ class LayerNorm(Module):
+             normalized_shape = self.normalized_shape
+         return layer_norm(x, normalized_shape, weight, bias, self.eps)
+ 
++class FP32LayerNorm(LayerNorm):
++    def forward(self, x, normalized_shape=None):
++        origin_dtype = x.dtype
++        weight = 1. if self.weight is None else self.weight.value
++        bias = 0. if self.bias is None else self.bias.value
++        if normalized_shape is None:
++            normalized_shape = self.normalized_shape
++        output = layer_norm(x.cast('float32'), normalized_shape, weight.cast('float32'), bias.cast('float32'), self.eps)
++        return output.cast(origin_dtype)
+ 
+ class RmsNorm(Module):
+ 
+@@ -117,3 +131,111 @@ class GroupNorm(Module):
+         weight = None if self.weight is None else self.weight.value
+         bias = None if self.bias is None else self.bias.value
+         return group_norm(x, self.num_groups, weight, bias, self.eps)
++
++class AdaLayerNormZero(Module):
++    r"""
++    Norm layer adaptive layer norm zero (adaLN-Zero).
++
++    Parameters:
++        embedding_dim (`int`): The size of each embedding vector.
++        num_embeddings (`int`): The size of the embeddings dictionary.
++    """
++
++    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True, mapping=None, dtype=None):
++        super().__init__()
++        if num_embeddings is not None:
++            raise NotImplementedError()
++        else:
++            self.emb = None
++
++        self.silu = SiLU()
++        self.linear = Linear(embedding_dim, 6 * embedding_dim, bias=bias, tp_group=mapping.tp_group, tp_size=mapping.tp_size, dtype=dtype)
++        if norm_type == "layer_norm":
++            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
++        elif norm_type == "fp32_layer_norm":
++            self.norm = FP32LayerNorm(embedding_dim, elementwise_affine=False, bias=False)
++        else:
++            raise ValueError(
++                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
++            )
++
++    def forward(
++        self,
++        x: Tensor,
++        timestep: Optional[Tensor] = None,
++        class_labels: Optional[Tensor] = None,
++        hidden_dtype: str = None,
++        emb: Optional[Tensor] = None,
++    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
++        if self.emb is not None:
++            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
++        emb = self.linear(self.silu(emb))
++        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunk(emb, chunks=6, dim=1)
++        x = self.norm(x) * (1 + unsqueeze(scale_msa, 1)) + unsqueeze(shift_msa, 1)
++        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
++
++class AdaLayerNormZeroSingle(Module):
++    r"""
++    Norm layer adaptive layer norm zero (adaLN-Zero).
++
++    Parameters:
++        embedding_dim (`int`): The size of each embedding vector.
++        num_embeddings (`int`): The size of the embeddings dictionary.
++    """
++
++    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True, mapping=None, dtype=None):
++        super().__init__()
++
++        self.silu = SiLU()
++        self.linear = Linear(embedding_dim, 3 * embedding_dim, bias=bias, tp_group=mapping.tp_group, tp_size=mapping.tp_size, dtype=dtype)
++        if norm_type == "layer_norm":
++            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
++        else:
++            raise ValueError(
++                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
++            )
++
++    def forward(
++        self,
++        x: Tensor,
++        emb: Optional[Tensor] = None,
++    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
++        emb = self.linear(self.silu(emb))
++        shift_msa, scale_msa, gate_msa = chunk(emb, 3, dim=1)
++        x = self.norm(x) * (1 + unsqueeze(scale_msa, 1)) + unsqueeze(shift_msa, 1)
++        return x, gate_msa
++
++
++class AdaLayerNormContinuous(Module):
++    def __init__(
++        self,
++        embedding_dim: int,
++        conditioning_embedding_dim: int,
++        # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
++        # because the output is immediately scaled and shifted by the projected conditioning embeddings.
++        # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
++        # However, this is how it was implemented in the original code, and it's rather likely you should
++        # set `elementwise_affine` to False.
++        elementwise_affine=True,
++        eps=1e-5,
++        bias=True,
++        norm_type="layer_norm",
++        mapping=None,
++        dtype=None
++    ):
++        super().__init__()
++        self.silu = SiLU()
++        self.linear = Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias, tp_group=mapping.tp_group, tp_size=mapping.tp_size, dtype=dtype)
++        if norm_type == "layer_norm":
++            self.norm = LayerNorm(embedding_dim, eps, elementwise_affine, bias)
++        elif norm_type == "rms_norm":
++            self.norm = RmsNorm(embedding_dim, eps, elementwise_affine)
++        else:
++            raise ValueError(f"unknown norm_type {norm_type}")
++
++    def forward(self, x: Tensor, conditioning_embedding: Tensor) -> Tensor:
++        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
++        emb = self.linear(self.silu(conditioning_embedding).cast(x.dtype))
++        scale, shift = chunk(emb, 2, dim=1)
++        x = self.norm(x) * unsqueeze((1 + scale), 1) + unsqueeze(shift, 1)
++        return x
+diff --git a/tensorrt_llm/models/__init__.py b/tensorrt_llm/models/__init__.py
+index e70ffc1318100b6c09e8957d025f18ce3ae82eeb..61749cc82ed48a989958da23fb1d9efb29f5d5e0 100755
+--- a/tensorrt_llm/models/__init__.py
++++ b/tensorrt_llm/models/__init__.py
+@@ -32,6 +32,7 @@ from .eagle.model import EagleForCausalLM
+ from .enc_dec.model import DecoderModel, EncoderModel, WhisperEncoder
+ from .falcon.config import FalconConfig
+ from .falcon.model import FalconForCausalLM, FalconModel
++from .flux.model import FluxTransformer2DModel
+ from .gemma.config import GEMMA2_ARCHITECTURE, GEMMA_ARCHITECTURE, GemmaConfig
+ from .gemma.model import GemmaForCausalLM
+ from .gpt.config import GPTConfig
+@@ -67,6 +68,7 @@ __all__ = [
+     'BloomModel',
+     'BloomForCausalLM',
+     'DiT',
++    'FluxTransformer2DModel',
+     'DeepseekForCausalLM',
+     'FalconConfig',
+     'DeepseekV2ForCausalLM',
+@@ -178,6 +180,7 @@ MODEL_MAP = {
+     'RecurrentGemmaForCausalLM': RecurrentGemmaForCausalLM,
+     'CogVLMForCausalLM': CogVLMForCausalLM,
+     'DiT': DiT,
++    'Flux': FluxTransformer2DModel,
+     'DeepseekForCausalLM': DeepseekForCausalLM,
+     'DeciLMForCausalLM': DeciLMForCausalLM,
+     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
+diff --git a/tensorrt_llm/models/flux/__init__.py b/tensorrt_llm/models/flux/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..71bf6d298d42a5b4c96f152285e9449a47b1656e
+--- /dev/null
++++ b/tensorrt_llm/models/flux/__init__.py
+@@ -0,0 +1,14 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+diff --git a/tensorrt_llm/models/flux/config.py b/tensorrt_llm/models/flux/config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bbcb5b39a0aad4372edc0cecc0dbd67c3738c117
+--- /dev/null
++++ b/tensorrt_llm/models/flux/config.py
+@@ -0,0 +1,102 @@
++# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++from typing import Optional
++
++from ...mapping import Mapping
++from ..convert_utils import infer_dtype
++from ..modeling_utils import PretrainedConfig, QuantConfig
++
++
++class FluxConfig(PretrainedConfig):
++
++    def __init__(self,
++                 *,
++                 attention_head_dim: 128,
++                 guidance_embeds: True,
++                 in_channels: 64,
++                 joint_attention_dim: 4096,
++                 num_attention_heads: 24,
++                 num_layers: 19,
++                 num_single_layers: 38,
++                 patch_size: 1,
++                 pooled_projection_dim: 768,
++                 **kwargs):
++
++        kwargs.update({
++            'hidden_size': attention_head_dim*num_attention_heads,
++            'num_hidden_layers': num_layers,
++            'num_attention_heads': num_attention_heads
++            })
++        super().__init__(**kwargs)
++        self.attention_head_dim = attention_head_dim
++        self.guidance_embeds = guidance_embeds
++        self.in_channels = in_channels
++        self.joint_attention_dim = joint_attention_dim
++        self.num_attention_heads = num_attention_heads
++        self.num_layers = num_layers # double blocks
++        self.num_single_layers = num_single_layers # single blocks
++        self.patch_size = patch_size
++        self.pooled_projection_dim = pooled_projection_dim
++
++    def to_dict(self):
++        output = super().to_dict()
++        # Serialize the fields added in FluxConfig
++        output['attention_head_dim'] = self.attention_head_dim
++        output['guidance_embeds'] = self.guidance_embeds
++        output['in_channels'] = self.in_channels
++        output['joint_attention_dim'] = self.joint_attention_dim
++        output['num_attention_heads'] = self.num_attention_heads
++        output['num_layers'] = self.num_layers
++        output['num_single_layers'] = self.num_single_layers
++        output['patch_size'] = self.patch_size
++        output['pooled_projection_dim'] = self.pooled_projection_dim
++        return output
++
++    @classmethod
++    def from_hugging_face(cls,
++                          hf_config_path: str,
++                          dtype: str = 'auto',
++                          mapping: Optional[Mapping] = None,
++                          quant_config: Optional[QuantConfig] = None,
++                          **kwargs) -> "FluxConfig":
++        from diffusers import FluxTransformer2DModel
++        hf_config = FluxTransformer2DModel.load_config(hf_config_path)
++
++        attention_head_dim = hf_config['attention_head_dim']
++        guidance_embeds = hf_config['guidance_embeds']
++        in_channels = hf_config['in_channels']
++        joint_attention_dim = hf_config['joint_attention_dim']
++        num_attention_heads = hf_config['num_attention_heads']
++        num_layers = hf_config['num_layers']
++        num_single_layers = hf_config['num_single_layers']
++        patch_size = hf_config['patch_size']
++        pooled_projection_dim = hf_config['pooled_projection_dim']
++        dtype = infer_dtype(dtype, hf_config.get('torch_dtype'))
++
++        return cls(
++            architecture='Flux',
++            attention_head_dim=attention_head_dim,
++            guidance_embeds = guidance_embeds,
++            in_channels = in_channels,
++            joint_attention_dim = joint_attention_dim,
++            num_attention_heads = num_attention_heads,
++            num_layers = num_layers,
++            num_single_layers = num_single_layers,
++            patch_size = patch_size,
++            pooled_projection_dim = pooled_projection_dim,
++            dtype=dtype,
++            mapping=mapping,
++            quantization=quant_config,
++            **kwargs)
+diff --git a/tensorrt_llm/models/flux/model.py b/tensorrt_llm/models/flux/model.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3da490b4b5e1372746bf111e6e13dc872936da9
+--- /dev/null
++++ b/tensorrt_llm/models/flux/model.py
+@@ -0,0 +1,750 @@
++import math
++from collections import OrderedDict
++from typing import Optional
++
++import numpy as np
++import tensorrt as trt
++
++from ..._common import default_net
++from ...functional import (Tensor, allgather, bert_attention, chunk, clip,
++                           concat, expand, matmul, shape, slice, softmax, stack)
++from ...layers import MLP, ColumnLinear, LayerNorm, Linear, RmsNorm, RowLinear
++from ...layers.activation import GELU
++from ...layers.embedding import (CombinedTimestepGuidanceTextProjEmbeddings,
++                                 CombinedTimestepTextProjEmbeddings,
++                                 FluxPosEmbed)
++from ...layers.normalization import (AdaLayerNormContinuous, AdaLayerNormZero,
++                                     AdaLayerNormZeroSingle)
++from ...mapping import Mapping
++from ...module import Module, ModuleList
++from ..model_weights_loader import ModelWeightsLoader
++from ..modeling_utils import PretrainedModel
++from .config import FluxConfig
++
++
++class FluxAttention(Module):
++    def __init__(self,
++            query_dim: int,
++            cross_attention_dim: Optional[int] = None,
++            added_kv_proj_dim: Optional[int] = None,
++            dim_head: int = 64,
++            heads: int = 8,
++            out_dim: int = None,
++            context_pre_only=None,
++            bias: bool = False,
++            qk_norm: Optional[str] = None,
++            eps: float = 1e-5,
++            pre_only=False,
++            mapping=None,
++            dtype=None):
++        super().__init__()
++
++        self.cp_size = mapping.cp_size
++        self.cp_group = mapping.cp_group
++        self.tp_group = mapping.tp_group
++        self.tp_size = mapping.tp_size
++        self.tp_rank = mapping.tp_rank
++
++        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
++        self.inner_kv_dim = self.inner_dim
++        self.query_dim = query_dim
++        self.use_bias = bias
++        self.is_cross_attention = cross_attention_dim is not None
++        self.cross_attention_dim = cross_attention_dim if cross_attention_dim is not None else query_dim
++        self.fused_projections = False
++        self.out_dim = out_dim if out_dim is not None else query_dim
++        self.context_pre_only = context_pre_only
++        self.pre_only = pre_only
++
++        self.heads = out_dim // dim_head if out_dim is not None else heads
++        self.heads = self.heads // self.tp_size
++        self.dim_head = dim_head
++        # default attn settings
++        self.norm_factor = math.sqrt(dim_head)
++        self.q_scaling = 1.0
++        self.max_distance = 0
++
++        self.added_kv_proj_dim = added_kv_proj_dim
++
++        self.group_norm = None
++        self.spatial_norm = None
++
++        added_proj_bias = True
++        out_bias = True
++
++        if qk_norm is None:
++            self.norm_q = None
++            self.norm_k = None
++        elif qk_norm == "layer_norm":
++            self.norm_q = LayerNorm(dim_head, eps=eps)
++            self.norm_k = LayerNorm(dim_head, eps=eps)
++        elif qk_norm == "rms_norm":
++            self.norm_q = RmsNorm(dim_head, eps=eps, dtype=dtype)
++            self.norm_k = RmsNorm(dim_head, eps=eps, dtype=dtype)
++        else:
++            raise ValueError(f"unknown qk_norm: {qk_norm}.")
++
++        self.norm_cross = None
++        self.dtype = dtype
++
++        self.to_q = ColumnLinear(query_dim, self.inner_dim, bias=bias, tp_group=self.tp_group, tp_size=self.tp_size, gather_output=False, dtype=dtype)
++        self.to_k = ColumnLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias, tp_group=self.tp_group, tp_size=self.tp_size, gather_output=False, dtype=dtype)
++        self.to_v = ColumnLinear(self.cross_attention_dim, self.inner_kv_dim, bias=bias, tp_group=self.tp_group, tp_size=self.tp_size, gather_output=False, dtype=dtype)
++
++        self.added_proj_bias = added_proj_bias
++        if self.added_kv_proj_dim is not None:
++            self.add_k_proj = ColumnLinear(added_kv_proj_dim, self.inner_kv_dim, bias=added_proj_bias, tp_group=self.tp_group, tp_size=self.tp_size, gather_output=False, dtype=dtype)
++            self.add_v_proj = ColumnLinear(added_kv_proj_dim, self.inner_kv_dim, bias=added_proj_bias, tp_group=self.tp_group, tp_size=self.tp_size, gather_output=False, dtype=dtype)
++            if self.context_pre_only is not None:
++                self.add_q_proj = ColumnLinear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias, tp_group=self.tp_group, tp_size=self.tp_size, gather_output=False, dtype=dtype)
++
++        if not self.pre_only:
++            self.to_out = ModuleList([RowLinear(self.inner_dim, self.out_dim, bias=out_bias, tp_group=self.tp_group, tp_size=self.tp_size, dtype=dtype)])
++
++        if self.context_pre_only is not None and not self.context_pre_only:
++            self.to_add_out = RowLinear(self.inner_dim, self.out_dim, bias=out_bias, tp_group=self.tp_group, tp_size=self.tp_size, dtype=dtype)
++
++        if qk_norm is not None and added_kv_proj_dim is not None:
++            if qk_norm == "rms_norm":
++                self.norm_added_q = RmsNorm(dim_head, eps=eps, dtype=dtype)
++                self.norm_added_k = RmsNorm(dim_head, eps=eps, dtype=dtype)
++            else:
++                raise ValueError(f"unknown qk_norm: {qk_norm}.")
++        else:
++            self.norm_added_q = None
++            self.norm_added_k = None
++
++    def forward(self,
++        hidden_states: Tensor,
++        encoder_hidden_states: Tensor = None,
++        attention_mask: Optional[Tensor] = None,
++        image_rotary_emb: Optional[Tensor] = None,
++        max_input_length: Optional[Tensor] = None,
++        ):
++        shape(hidden_states, 0) if encoder_hidden_states is None else shape(encoder_hidden_states, 0)
++        if attention_mask is not None:
++            raise NotImplementedError()
++
++        # `sample` projections.
++        query = self.to_q(hidden_states)
++        key = self.to_k(hidden_states)
++        value = self.to_v(hidden_states)
++
++        head_dim = self.dim_head
++        inner_dim = head_dim * self.heads
++
++        def bsd_to_bsnh(x):
++            # inner_dim -> heads, head_dim
++            bs = shape(x, 0)
++            seq_len = shape(x, 1)
++            hid_dim = shape(x, 2)
++            x = x.view(concat([bs, seq_len, hid_dim//head_dim, head_dim]))
++            return x
++        def bsnh_to_bsd(x):
++            bs = shape(x, 0)
++            seq_len = shape(x, 1)
++            num_heads = shape(x, 2)
++            x = x.view(concat([bs, seq_len, num_heads*head_dim]))
++            return x
++
++        if self.norm_q is not None:
++            query = bsd_to_bsnh(query)
++            query = self.norm_q(query)
++            query = bsnh_to_bsd(query)
++        if self.norm_k is not None:
++            key = bsd_to_bsnh(key)
++            key = self.norm_k(key)
++            key = bsnh_to_bsd(key)
++
++        # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
++        if encoder_hidden_states is not None:
++            # `context` projections.
++            encoder_hidden_states_query_proj = self.add_q_proj(encoder_hidden_states)
++            encoder_hidden_states_key_proj = self.add_k_proj(encoder_hidden_states)
++            encoder_hidden_states_value_proj = self.add_v_proj(encoder_hidden_states)
++
++            if self.norm_added_q is not None:
++                encoder_hidden_states_query_proj = bsd_to_bsnh(encoder_hidden_states_query_proj)
++                encoder_hidden_states_query_proj = self.norm_added_q(encoder_hidden_states_query_proj)
++                encoder_hidden_states_query_proj = bsnh_to_bsd(encoder_hidden_states_query_proj)
++            if self.norm_added_k is not None:
++                encoder_hidden_states_key_proj = bsd_to_bsnh(encoder_hidden_states_key_proj)
++                encoder_hidden_states_key_proj = self.norm_added_k(encoder_hidden_states_key_proj)
++                encoder_hidden_states_key_proj = bsnh_to_bsd(encoder_hidden_states_key_proj)
++
++            # attention
++            query = concat([encoder_hidden_states_query_proj, query], dim=1)
++            key = concat([encoder_hidden_states_key_proj, key], dim=1)
++            value = concat([encoder_hidden_states_value_proj, value], dim=1)
++
++        if image_rotary_emb is not None:
++            def apply_rotary_emb(x, position_embedding, mark_prefix='query_'):
++                x = bsd_to_bsnh(x).permute([0, 2, 1, 3])
++                cos, sin = position_embedding
++                cos = cos.unsqueeze(0).unsqueeze(0)
++                sin = sin.unsqueeze(0).unsqueeze(0)
++                b, s, h, d = shape(x, 0), shape(x, 1), shape(x, 2), shape(x, 3)
++                x_real, x_imag = x.view(concat([b, s, h, d/2, 2])).unbind(-1)
++                x_rotated = stack([0-x_imag, x_real], dim=-1).flatten(3)
++                out = (x.cast(cos.dtype) * cos + x_rotated.cast(sin.dtype) * sin).cast(x.dtype)
++                out = out.permute([0, 2, 1, 3])
++                return out
++            query = bsnh_to_bsd(apply_rotary_emb(query, image_rotary_emb, mark_prefix='query_'))
++            key = bsnh_to_bsd(apply_rotary_emb(key, image_rotary_emb, mark_prefix='key_'))
++
++        if default_net().plugin_config.bert_attention_plugin:
++            # TRT plugin mode
++            assert self.cp_size == 1
++            seq_len = shape(query, 1)
++            qkv = concat([query, key, value], dim=-1)
++            input_lengths = expand(shape(qkv, 1).unsqueeze(0), shape(qkv, 0).unsqueeze(0)).cast("int32")
++
++            hidden_states = bert_attention(
++                qkv,
++                input_lengths,
++                self.heads,
++                head_dim,
++                q_scaling=self.q_scaling,
++                relative_attention=False,
++                max_distance=self.max_distance,
++                relative_attention_bias=None,
++                max_input_length=max_input_length)
++        else:
++            # plain TRT mode
++            def transpose_for_scores(x):
++                new_x_shape = concat([
++                    shape(x, 0),
++                    shape(x, 1), self.heads,
++                    head_dim
++                ])
++                return x.view(new_x_shape).permute([0, 2, 1, 3])
++
++            if self.cp_size > 1 and self.cp_group is not None:
++                key = allgather(key, self.cp_group, gather_dim=1)
++                value = allgather(value, self.cp_group, gather_dim=1)
++            query = transpose_for_scores(query)
++            key = transpose_for_scores(key)
++            value = transpose_for_scores(value)
++
++            key = key.permute([0, 1, 3, 2])
++            attention_scores = matmul(query, key, use_fp32_acc=False)
++            attention_scores = attention_scores / (self.q_scaling *
++                                                   self.norm_factor)
++
++            attention_probs = softmax(attention_scores, dim=-1)
++
++            context = matmul(attention_probs, value,
++                             use_fp32_acc=False).permute([0, 2, 1, 3])
++            hidden_states = context.view(
++                concat([
++                    shape(context, 0),
++                    shape(context, 1), inner_dim
++                ]))
++
++        if encoder_hidden_states is not None:
++            bs, seq_len = shape(hidden_states, 0), shape(hidden_states, 1)
++            enc_seq_len = shape(encoder_hidden_states, 1)
++            encoder_hidden_states = slice(hidden_states, starts=[0,0,0], sizes=concat([bs, enc_seq_len, inner_dim]))
++            hidden_states = slice(hidden_states, starts=concat([0, enc_seq_len, 0]), sizes=concat([bs, seq_len-enc_seq_len, inner_dim]))
++
++            # linear proj
++            hidden_states = self.to_out[0](hidden_states)
++            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
++
++            return hidden_states, encoder_hidden_states
++        else:
++            if self.tp_size > 1:
++                hidden_states = bsd_to_bsnh(hidden_states)
++                # gather across 'num_heads' dim
++                hidden_states = allgather(hidden_states, group=self.tp_group, gather_dim=2)
++                hidden_states = bsnh_to_bsd(hidden_states)
++            return hidden_states
++
++
++class FluxTransformerBlock(Module):
++    r"""
++    A Transformer block following the MMDiT architecture, introduced in Stable Diffusion 3.
++
++    Reference: https://arxiv.org/abs/2403.03206
++
++    Parameters:
++        dim (`int`): The number of channels in the input and output.
++        num_attention_heads (`int`): The number of heads to use for multi-head attention.
++        attention_head_dim (`int`): The number of channels in each head.
++        context_pre_only (`bool`): Boolean to determine if we should add some blocks associated with the
++            processing of `context` conditions.
++    """
++
++    def __init__(self, dim, num_attention_heads, attention_head_dim, qk_norm="rms_norm", eps=1e-6, mapping=None, dtype=None):
++        super().__init__()
++
++        self.norm1 = AdaLayerNormZero(dim, mapping=mapping, dtype=dtype)
++
++        self.norm1_context = AdaLayerNormZero(dim, mapping=mapping, dtype=dtype)
++
++        self.attn = FluxAttention(
++            query_dim=dim,
++            cross_attention_dim=None,
++            added_kv_proj_dim=dim,
++            dim_head=attention_head_dim,
++            heads=num_attention_heads,
++            out_dim=dim,
++            context_pre_only=False,
++            bias=True,
++            qk_norm=qk_norm,
++            eps=eps,
++            mapping=mapping,
++            dtype=dtype
++        )
++
++        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
++        self.ff = MLP(hidden_size=dim, ffn_hidden_size=4*dim, hidden_act='gelu', tp_group=mapping.tp_group, tp_size=mapping.tp_size, dtype=dtype)
++
++        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
++        self.ff_context = MLP(hidden_size=dim, ffn_hidden_size=4*dim, hidden_act='gelu', tp_group=mapping.tp_group, tp_size=mapping.tp_size, dtype=dtype)
++
++    def forward(
++        self,
++        hidden_states: Tensor,
++        encoder_hidden_states: Tensor,
++        temb: Tensor,
++        image_rotary_emb=None,
++    ):
++        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb=temb)
++
++        norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
++            encoder_hidden_states, emb=temb
++        )
++
++        # Attention.
++        attn_output, context_attn_output = self.attn(
++            hidden_states=norm_hidden_states,
++            encoder_hidden_states=norm_encoder_hidden_states,
++            image_rotary_emb=image_rotary_emb,
++        )
++
++        # Process attention outputs for the `hidden_states`.
++        attn_output = gate_msa.unsqueeze(1) * attn_output
++        hidden_states = hidden_states + attn_output
++
++        norm_hidden_states = self.norm2(hidden_states)
++        norm_hidden_states = norm_hidden_states * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
++
++        ff_output = self.ff(norm_hidden_states)
++        ff_output = gate_mlp.unsqueeze(1) * ff_output
++
++        hidden_states = hidden_states + ff_output
++
++        # Process attention outputs for the `encoder_hidden_states`.
++
++        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
++        encoder_hidden_states = encoder_hidden_states + context_attn_output
++
++        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
++        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp.unsqueeze(1)) + c_shift_mlp.unsqueeze(1)
++
++        context_ff_output = self.ff_context(norm_encoder_hidden_states)
++        encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
++        if encoder_hidden_states.dtype == trt.DataType.HALF:
++            encoder_hidden_states = clip(encoder_hidden_states, -65504, 65504)
++
++        return encoder_hidden_states, hidden_states
++
++
++class FluxSingleTransformerBlock(Module):
++    r"""
++    A Transformer block following the MMDiT architecture, introduced in Stable Diffusion 3.
++
++    Reference: https://arxiv.org/abs/2403.03206
++
++    Parameters:
++        dim (`int`): The number of channels in the input and output.
++        num_attention_heads (`int`): The number of heads to use for multi-head attention.
++        attention_head_dim (`int`): The number of channels in each head.
++        context_pre_only (`bool`): Boolean to determine if we should add some blocks associated with the
++            processing of `context` conditions.
++    """
++
++    def __init__(self, dim, num_attention_heads, attention_head_dim, mlp_ratio=4.0, mapping=None, dtype=None):
++        super().__init__()
++        self.mlp_hidden_dim = int(dim * mlp_ratio)
++
++        self.cp_size = mapping.cp_size
++        self.cp_group = mapping.cp_group
++        self.tp_group = mapping.tp_group
++        self.tp_size = mapping.tp_size
++        self.tp_rank = mapping.tp_rank
++
++        self.norm = AdaLayerNormZeroSingle(dim, mapping=mapping, dtype=dtype)
++        self.proj_mlp = Linear(dim, self.mlp_hidden_dim, tp_group=self.tp_group, tp_size=self.tp_size, dtype=dtype)
++        self.act_mlp = GELU(approximate="tanh")
++        self.proj_out = Linear(dim + self.mlp_hidden_dim, dim, tp_group=self.tp_group, tp_size=self.tp_size, dtype=dtype)
++
++        self.attn = FluxAttention(
++            query_dim=dim,
++            cross_attention_dim=None,
++            dim_head=attention_head_dim,
++            heads=num_attention_heads,
++            out_dim=dim,
++            bias=True,
++            qk_norm="rms_norm",
++            eps=1e-6,
++            pre_only=True,
++            mapping=mapping,
++            dtype=dtype
++        )
++
++    def forward(
++        self,
++        hidden_states: Tensor,
++        temb: Tensor,
++        image_rotary_emb=None,
++    ):
++        residual = hidden_states
++        norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
++        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
++
++        attn_output = self.attn(
++            hidden_states=norm_hidden_states,
++            image_rotary_emb=image_rotary_emb,
++        )
++
++        hidden_states = concat([attn_output, mlp_hidden_states], dim=2)
++        gate = gate.unsqueeze(1)
++        hidden_states = gate * self.proj_out(hidden_states)
++        hidden_states = residual + hidden_states
++        if hidden_states.dtype == trt.DataType.HALF:
++            hidden_states = clip(hidden_states, -65504, 65504)
++
++        return hidden_states
++
++
++class FluxTransformer2DModel(PretrainedModel):
++    config_class = FluxConfig
++
++    def __init__(self, config: FluxConfig):
++        super().__init__(config)
++        self.quant_mode = config.quant_mode
++        self.mapping = config.mapping
++        self.dtype = config.dtype
++
++        self.in_channels = config.in_channels
++        self.out_channels = self.in_channels
++
++        self.inner_dim = config.num_attention_heads * config.attention_head_dim
++
++        # TODO: remove hard code
++        axes_dims_rope = (16, 56, 56)
++        self.pos_embed = FluxPosEmbed(theta=10000, axes_dim=axes_dims_rope)
++
++        text_time_guidance_cls = (
++            CombinedTimestepGuidanceTextProjEmbeddings if config.guidance_embeds else CombinedTimestepTextProjEmbeddings
++        )
++        self.time_text_embed = text_time_guidance_cls(
++            embedding_dim=self.inner_dim, pooled_projection_dim=config.pooled_projection_dim, mapping=self.mapping, dtype=self.dtype
++        )
++
++        self.context_embedder = Linear(config.joint_attention_dim, self.inner_dim, tp_group=self.mapping.tp_group, tp_size=self.mapping.tp_size, dtype=self.dtype)
++        self.x_embedder = Linear(config.in_channels, self.inner_dim, tp_group=self.mapping.tp_group, tp_size=self.mapping.tp_size, dtype=self.dtype)
++
++        self.transformer_blocks = ModuleList(
++            [
++                FluxTransformerBlock(
++                    dim=self.inner_dim,
++                    num_attention_heads=config.num_attention_heads,
++                    attention_head_dim=config.attention_head_dim,
++                    mapping=self.mapping,
++                    dtype=self.dtype
++                )
++                for i in range(config.num_layers)
++            ]
++        )
++
++        self.single_transformer_blocks = ModuleList(
++            [
++                FluxSingleTransformerBlock(
++                    dim=self.inner_dim,
++                    num_attention_heads=self.config.num_attention_heads,
++                    attention_head_dim=self.config.attention_head_dim,
++                    mapping=self.mapping,
++                    dtype=self.dtype
++                )
++                for i in range(self.config.num_single_layers)
++            ]
++        )
++
++        self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6, mapping=self.mapping, dtype=self.dtype)
++        self.proj_out = Linear(self.inner_dim, config.patch_size * config.patch_size * self.out_channels, bias=True, tp_group=self.mapping.tp_group, tp_size=self.mapping.tp_size, dtype=self.dtype)
++
++
++    def forward(
++        self,
++        hidden_states: Tensor,
++        encoder_hidden_states: Tensor = None,
++        pooled_projections: Tensor = None,
++        timestep: Tensor = None,
++        img_ids: Tensor = None,
++        txt_ids: Tensor = None,
++        guidance: Tensor = None,
++        controlnet_block_samples=None,
++        controlnet_single_block_samples=None,
++    ) -> Tensor:
++        """
++        The [`FluxTransformer2DModel`] forward method.
++
++        Args:
++            hidden_states (`FloatTensor` of shape `(batch size, img_seq, in_channels)`):
++                Input `hidden_states`.
++            encoder_hidden_states (`FloatTensor` of shape `(batch size, sequence_len, embed_dims)`):
++                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
++            pooled_projections (`FloatTensor` of shape `(batch_size, projection_dim)`): Embeddings projected
++                from the embeddings of input conditions.
++            timestep ( `LongTensor`):
++                Used to indicate denoising step.
++            block_controlnet_hidden_states: (`list` of `Tensor`):
++                A list of tensors that if specified are added to the residuals of transformer blocks.
++            return_dict (`bool`, *optional*, defaults to `True`):
++                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
++                tuple.
++
++        Returns:
++            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
++            `tuple` where the first element is the sample tensor.
++        """
++        if self.mapping.cp_size > 1:
++            hidden_states = chunk(hidden_states, chunks=self.mapping.cp_size, dim=1)[self.mapping.cp_rank]
++            encoder_hidden_states = chunk(encoder_hidden_states, chunks=self.mapping.cp_size, dim=1)[self.mapping.cp_rank]
++
++        hidden_states = self.x_embedder(hidden_states)
++
++        timestep = timestep.cast(hidden_states.dtype) * 1000
++        if guidance is not None:
++            guidance = guidance.cast(hidden_states.dtype) * 1000
++        else:
++            guidance = None
++        temb = (
++            self.time_text_embed(timestep, pooled_projections)
++            if guidance is None
++            else self.time_text_embed(timestep, guidance, pooled_projections)
++        )
++        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
++
++        if txt_ids.ndim() == 3:
++            txt_ids = txt_ids[0]
++        if img_ids.ndim() == 3:
++            img_ids = img_ids[0]
++
++        ids = concat((txt_ids, img_ids), dim=0)
++        image_rotary_emb = self.pos_embed(ids)
++        if self.mapping.cp_size > 1:
++            cos, sin = image_rotary_emb
++            cos = chunk(cos, chunks=self.mapping.cp_size, dim=0)[self.mapping.cp_rank]
++            sin = chunk(sin, chunks=self.mapping.cp_size, dim=0)[self.mapping.cp_rank]
++            image_rotary_emb = (cos, sin)
++
++        for index_block, block in enumerate(self.transformer_blocks):
++            encoder_hidden_states, hidden_states = block(
++                hidden_states=hidden_states,
++                encoder_hidden_states=encoder_hidden_states,
++                temb=temb,
++                image_rotary_emb=image_rotary_emb,
++            )
++
++            # controlnet residual
++            if controlnet_block_samples is not None:
++                interval_control = len(self.transformer_blocks) / len(controlnet_block_samples)
++                interval_control = int(np.ceil(interval_control))
++                control_feature = controlnet_block_samples[index_block // interval_control]
++                if self.mapping.cp_size > 1:
++                    control_feature = chunk(control_feature, chunks=self.mapping.cp_size, dim=1)[self.mapping.cp_rank]
++                hidden_states = hidden_states + control_feature
++
++
++        hidden_states = concat([encoder_hidden_states, hidden_states], dim=1)
++
++        for index_block, block in enumerate(self.single_transformer_blocks):
++            hidden_states = block(
++                hidden_states=hidden_states,
++                temb=temb,
++                image_rotary_emb=image_rotary_emb,
++            )
++
++            # controlnet residual
++            if controlnet_single_block_samples is not None:
++                interval_control = len(self.single_transformer_blocks) / len(controlnet_single_block_samples)
++                interval_control = int(np.ceil(interval_control))
++                control_feature = controlnet_single_block_samples[index_block // interval_control]
++                if self.mapping.cp_size > 1:
++                    control_feature = chunk(control_feature, chunks=self.mapping.cp_size, dim=1)[self.mapping.cp_rank]
++                bs, seq_len = shape(hidden_states, 0), shape(hidden_states, 1)
++                enc_seq_len = shape(encoder_hidden_states, 1)
++                encoder_hidden_states = slice(hidden_states, starts=[0,0,0], sizes=concat([bs, enc_seq_len, self.inner_dim]))
++                hidden_states = slice(hidden_states, starts=concat([0, enc_seq_len, 0]), sizes=concat([bs, seq_len-enc_seq_len, self.inner_dim]))
++                hidden_states = hidden_states + control_feature
++                hidden_states = concat([encoder_hidden_states, hidden_states], dim=1)
++
++        bs, seq_len = shape(hidden_states, 0), shape(hidden_states, 1)
++        enc_seq_len = shape(encoder_hidden_states, 1)
++        hidden_states = slice(hidden_states, starts=concat([0, enc_seq_len, 0]), sizes=concat([bs, seq_len-enc_seq_len, self.inner_dim]))
++
++        hidden_states = self.norm_out(hidden_states, temb)
++        hidden_states = self.proj_out(hidden_states)
++        if self.mapping.cp_size > 1:
++            hidden_states = allgather(hidden_states, group=self.mapping.cp_group, gather_dim=1)
++        hidden_states.mark_output("output", hidden_states.dtype)
++
++        return hidden_states
++
++    def prepare_inputs(self, max_batch_size, **kwargs):
++        '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the ranges of the dimensions of when using TRT dynamic shapes.
++           @return: a list contains values which can be fed into the self.forward()
++        '''
++        def flux_default_range(max_batch_size):
++            return [1, max(1, (max_batch_size + 1) // 2), max_batch_size]
++        default_range = flux_default_range
++        # TODO: customized input h/w
++        input_h, input_w = 1024, 1024
++        H = input_h / 8
++        W = input_w / 8
++        img_seq_len = int(H*W/4)
++        txt_len = 512
++
++        hidden_states = Tensor(
++                name='hidden_states', dtype=self.dtype,
++                shape=[-1, img_seq_len, self.config.in_channels],
++                dim_range=OrderedDict([
++                    ('batch_size', [default_range(max_batch_size)]),
++                    ('img_seq_len',[[img_seq_len]*3]),
++                    ('in_channels',[[self.config.in_channels]*3]),
++              ]))
++        encoder_hidden_states = Tensor(
++                name='encoder_hidden_states', dtype=self.dtype,
++                shape=[-1, txt_len, 4096],
++                dim_range=OrderedDict([
++                    ('batch_size', [default_range(max_batch_size)]),
++                    ('txt_len',[[txt_len]*3]),
++                    ('joint_attention_dim',[[self.config.joint_attention_dim]*3]),
++              ]))
++        pooled_projections = Tensor(
++                name='pooled_projections', dtype=self.dtype,
++                shape=[-1, self.config.pooled_projection_dim],
++                dim_range=OrderedDict([
++                    ('batch_size', [default_range(max_batch_size)]),
++                    ('pooled_projection_dim',[[self.config.pooled_projection_dim]*3]),
++              ]))
++        timestep = Tensor(
++                name='timestep', dtype=self.dtype,
++                shape=[-1],
++                dim_range=OrderedDict([
++                    ('batch_size', [default_range(max_batch_size)]),
++              ]))
++        img_ids = Tensor(
++                name='img_ids', dtype=self.dtype,
++                shape=[img_seq_len, 3],
++                dim_range=OrderedDict([
++                    ('img_seq_len',[[img_seq_len]*3]),
++                    ('channels',[[3]*3]),
++              ]))
++        txt_ids = Tensor(
++                name='txt_ids', dtype=self.dtype,
++                shape=[txt_len, 3],
++                dim_range=OrderedDict([
++                    ('txt_len',[[txt_len]*3]),
++                    ('channels',[[3]*3]),
++              ]))
++        guidance = Tensor(
++                name='guidance', dtype=trt.float32,
++                shape=[-1],
++                dim_range=OrderedDict([
++                    ('batch_size', [default_range(max_batch_size)]),
++              ]))
++        return {
++            'hidden_states': hidden_states,
++            'encoder_hidden_states':encoder_hidden_states,
++            'pooled_projections': pooled_projections,
++            'timestep': timestep,
++            'img_ids': img_ids,
++            'txt_ids': txt_ids,
++            'guidance': guidance
++        }
++
++    @classmethod
++    def from_hugging_face(
++            cls,
++            hf_model_or_dir: str,
++            dtype: str = 'auto',
++            mapping: Optional[Mapping] = None,
++            **kwargs):
++        ''' Create a LLaMAForCausalLM object from give parameters
++        '''
++        quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)
++
++        hf_model_dir = hf_model_or_dir
++        hf_config_or_dir = hf_model_or_dir
++
++        config = FluxConfig.from_hugging_face(
++            hf_config_or_dir,
++            dtype=dtype,
++            mapping=mapping,
++            **kwargs
++        )
++
++        custom_dict = {}
++        if quant_ckpt_path is not None:
++            hf_model_dir = quant_ckpt_path
++
++        loader = FluxModelWeightsLoader(hf_model_dir, custom_dict)
++        model = cls(config)
++        loader.generate_tllm_weights(model)
++        return model
++
++
++class FluxModelWeightsLoader(ModelWeightsLoader):
++    def translate_to_external_key(
++            self, tllm_key: str,
++            tllm_to_externel_key_dict: dict):
++        """Translate TRT-LLM key into HF key or HF key list (e.g. QKV/MoE/GPTQ)
++
++        Base class mapping methods:
++        tllm_key : "transformer.layers.0.attention.  qkv .weight"
++                          |        |   |     |        |     |
++        translated: ["  model  .layers.0.self_attn.q_proj.weight,
++                     "  model  .layers.0.self_attn.k_proj.weight,
++                     "  model  .layers.0.self_attn.v_proj.weight]
++
++        However, Flux's HF model and TRT-LLM model don't have same hierarchical structure.
++        E.g.,
++        trtllm_key: "transformer_blocks.0.ff.fc.weight"
++        HF_key:     "transformer_blocks.0.ff.net.0.proj.weight"
++
++        So we rewrite ModelWeightsLoader here.
++
++        Args:
++            tllm_key (str): Input TRT-LLM key.
++            tllm_to_externel_key_dict (dict): User specified dict with higher priority. \
++            Generated from layer attributes automatically.
++
++        Returns:
++            hf_keys (str | list[str]) : Translated HF key(s).
++        """
++        trtllm_to_hf_name = {
++            'transformer_blocks.(\d+).(\w+).fc.weight':
++            'transformer_blocks.*.*.net.0.proj.weight',
++            'transformer_blocks.(\d+).(\w+).fc.bias':
++            'transformer_blocks.*.*.net.0.proj.bias',
++            'transformer_blocks.(\d+).(\w+).proj.weight':
++            'transformer_blocks.*.*.net.2.weight',
++            'transformer_blocks.(\d+).(\w+).proj.bias':
++            'transformer_blocks.*.*.net.2.bias',
++        }
++        import re
++        for k, v in trtllm_to_hf_name.items():
++            m = re.match(k, tllm_key)
++            if m is not None:
++                matched_pos = m.groups()
++                placeholders = v.count('*')
++                assert len(matched_pos) == placeholders
++                for i in range(len(matched_pos)):
++                    v = v.replace('*', matched_pos[i], 1)
++                return v
++        return tllm_key
+diff --git a/tensorrt_llm/models/modeling_utils.py b/tensorrt_llm/models/modeling_utils.py
+index b43d592923be0963743247a608a1f61b847ed47f..d7700acebacf364950fbdee034def1f4965594de 100644
+--- a/tensorrt_llm/models/modeling_utils.py
++++ b/tensorrt_llm/models/modeling_utils.py
+@@ -650,6 +650,11 @@ class PretrainedModel(Module,
+                                      config,
+                                      from_pruned=is_checkpoint_pruned)
+         model = cls(config)
++        """
++        if rank == 0:
++            for k, v in model.named_parameters():
++                print(k, v.shape, v.dtype)
++        """
+         model.load(weights, from_pruned=is_checkpoint_pruned)
+         return model
+ 
